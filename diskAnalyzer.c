@@ -119,7 +119,7 @@ void recoverDeletedClusters(int FirstLogicalCluster, int FileSize,  FILE * fileP
         else
         {
             outputClusterToFile(FirstLogicalCluster, SECTOR_SIZE, filePath);
-            recoverDeletedClusters(FATVALUE, FileSize, filePath, currentClustNum + 1);
+            recoverDeletedClusters(FirstLogicalCluster+1, FileSize, filePath, currentClustNum + 1);
         }
     }
 }
