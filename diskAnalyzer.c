@@ -40,6 +40,8 @@
 
 
 unsigned char * disk;
+char * outputDirectory;
+int fileNumber = 0;
 
 int * FAT_TABLE;
 typedef struct FATPair{
@@ -48,11 +50,20 @@ typedef struct FATPair{
 
 }FATPair_t;
 
+typedef struct filePair{
+    char * fullFilePath;
+    char * fileName;
+}filePair_t;
+
+
 
 FATPair_t  getFatEntry(unsigned char* firstByte, int i);
 void loadFatTable(unsigned char * first);
-void scanDirectoryEntry(char * filePath, unsigned char * DirectoryEntry, int directoryEntryNum);
-int scanFileClusters(int FirstLogicalCluster, int FileSize, char * filePath);
+void scanDirectoryEntry(char * filePath, unsigned char * DirectoryEntry, int directoryEntryNum, int firstLogicalCluster);
+void scanFileClusters(int FirstLogicalCluster, int FileSize, FILE * outputFile);
+unsigned char * logicClustToPoint(int logicalCluster);
+filePair_t appendFiletoFilePath(char * filePath, unsigned char * FILENAME, unsigned char * EXTENSION);
+char * appendDirectoryToFilePath(char * filePath, unsigned char * FILENAME);
 
 
 
@@ -71,6 +82,47 @@ int scanFileClusters(int FirstLogicalCluster, int FileSize, char * filePath);
 
 
 
+void outputClusterToFile(int firstLogicalCluster, int numBytesToRead, FILE * file )
+{
+    unsigned char * currentByteToRead = logicClustToPoint(firstLogicalCluster);
+    fwrite(currentByteToRead, sizeof(char), numBytesToRead, file);
+}
+
+void scanFileClusters(int FirstLogicalCluster, int FileSize,  FILE * filePath)
+{
+    int FATVALUE = FAT_TABLE[FirstLogicalCluster];
+    if(FATVALUE >= 0xff8)
+    {
+        //Cluster in use, last cluster in file
+        int bytesToRead = FileSize%SECTOR_SIZE;
+        outputClusterToFile(FirstLogicalCluster, bytesToRead, filePath);
+    }
+    else if (FATVALUE >= 2 && FATVALUE <= 0xfef)
+    {
+        //Cluster in use specify next cluster in file
+        outputClusterToFile(FirstLogicalCluster, SECTOR_SIZE, filePath);
+        scanFileClusters(FATVALUE, FileSize, filePath);
+    }
+}
+
+void recoverDeletedClusters(int FirstLogicalCluster, int FileSize,  FILE * filePath, int currentClustNum)
+{
+    int FATVALUE = FAT_TABLE[FirstLogicalCluster];
+
+    if(FATVALUE == 0)
+    {
+        if(SECTOR_SIZE * currentClustNum >= FileSize)
+        {
+            int bytesToRead = FileSize%SECTOR_SIZE;
+            outputClusterToFile(FirstLogicalCluster, bytesToRead, filePath);
+        }
+        else
+        {
+            outputClusterToFile(FirstLogicalCluster, SECTOR_SIZE, filePath);
+            recoverDeletedClusters(FATVALUE, FileSize, filePath, currentClustNum + 1);
+        }
+    }
+}
 
 int main(int argc, char * argv[])
 {
@@ -88,10 +140,17 @@ int main(int argc, char * argv[])
     disk = mmap ( NULL , SECTOR_SIZE * NUM_OF_SECTORS ,
     PROT_READ ,
     MAP_PRIVATE  , fd , 0) ;
+    int mode = 0777;
+
+
+    outputDirectory = malloc(strlen(argv[2]));
+    strcpy(outputDirectory, argv[2]);
+    mkdir(argv[2], mode);
 
     loadFatTable(disk + SECTOR_SIZE);
     unsigned char * StartOfRoot = disk +(SECTOR_SIZE * ROOT_DIRECT_START_SECTOR);
-    scanDirectoryEntry("/", StartOfRoot,0);
+    scanDirectoryEntry("/", StartOfRoot,0, 0);
+    //munmap(disk, SECTOR_SIZE * NUM_OF_SECTORS);
 
 }
 
@@ -124,7 +183,7 @@ FATPair_t  getFatEntry(unsigned char * first, int i)
     int thirdByte = (int)(*third);
 
     int firstEntry = firstByte | ( (secondByte & 0x0F) << 8);
-    int secondEntry = (thirdByte << 8) | ((secondByte & 0xF0) >> 4);
+    int secondEntry = (thirdByte << 4) | ((secondByte & 0xF0) >> 4);
 
     FATPair_t pair;
     pair.Entry1 = firstEntry;
@@ -135,8 +194,14 @@ FATPair_t  getFatEntry(unsigned char * first, int i)
 
 
 
+unsigned char * logicClustToPoint(int firstLogicalCluster)
+{
+    int sectorNumber = 33 + firstLogicalCluster - 2;
+    unsigned char * sectorToScan = disk + ((SECTOR_SIZE*sectorNumber)) ;
+    return sectorToScan;
+}
 
-void scanDirectoryEntry(char * filePath, unsigned char * DirectoryEntry, int DirectoryEntryNum)
+void scanDirectoryEntry(char * filePath, unsigned char * DirectoryEntry, int DirectoryEntryNum, int currentLogicalCluster)
 {
     //Here we get Information About the Current DirectoryEntry
     unsigned char * FILENAME = DirectoryEntry;
@@ -154,28 +219,76 @@ void scanDirectoryEntry(char * filePath, unsigned char * DirectoryEntry, int Dir
         return;
     }
 
-    else if(((int)(*FILENAME)) == DELETED_ENTRY_BYTE)
-    {
-        //Put your Deleted Logic Here
-    }
-
-
     else if((((int) ATTRIBUTES) & DIRECTORY_ATTRIBUTE_MASK) == DIRECTORY_ATTRIBUTE_MASK)
     {
-        //Appending the subdirectory to the filePath parameter
+        char * newFilePath = appendDirectoryToFilePath(filePath, FILENAME);
+        scanDirectoryEntry(newFilePath, (logicClustToPoint(FIRST_LOGICAL_CLUSTER)) + (DIRECTORY_ENTRY_SIZE *2),2, FIRST_LOGICAL_CLUSTER);
+    }
+    else
+    {
+        filePair_t pair = appendFiletoFilePath(filePath, FILENAME, EXTENSION);
+        char * newFile = pair.fileName;
+        char * newFilePath = pair.fullFilePath;
+
+
+        char * outputDirectString = malloc(strlen(newFile) + strlen(outputDirectory) + 2);
+        strcpy(outputDirectString,outputDirectory);
+        outputDirectString[strlen(outputDirectory)] = '/';
+        outputDirectString[strlen(outputDirectory) + 1]= '\0';
+        strcat(outputDirectString, newFile);
+        outputDirectString[strlen(newFile) + strlen(outputDirectory) + 1] = '\0';
+        FILE * file = fopen(outputDirectString, "wb");
+
+        if(((int)(*FILENAME)) == DELETED_ENTRY_BYTE)
+        {
+            recoverDeletedClusters(FIRST_LOGICAL_CLUSTER,FILESIZE,file, 1);
+            printf("FILE\tDELETED\t%s\t%d\n", newFilePath, FILESIZE);
+        }
+        else
+        {
+            scanFileClusters(FIRST_LOGICAL_CLUSTER, FILESIZE, file);
+            printf("FILE\tNORMAL\t%s\t%d\n", newFilePath, FILESIZE);
+        }
+        fclose(file);
+        free(outputDirectString);
+        free(newFile);
+        free(newFilePath);
+    }
+
+    if(DirectoryEntryNum != DIRECTORY_ENTRIES_PER_SECTOR -1)
+        scanDirectoryEntry(filePath, DirectoryEntry+32, DirectoryEntryNum+1, currentLogicalCluster);
+    else
+    {
+        int FATValue = FAT_TABLE[FIRST_LOGICAL_CLUSTER];
+        if (FATValue >= 0x002 && FATValue <= 0xfef)
+            scanDirectoryEntry(filePath, logicClustToPoint(FATValue) ,  0, FATValue);
+    }
+    //free(filePath);
+
+}
+
+
+
+
+char * appendDirectoryToFilePath(char * filePath, unsigned char * FILENAME)
+{
+     //Appending the subdirectory to the filePath parameter
         int len = 0;
         char  * newDirectory = malloc(sizeof(char) * MAX_LENGTH_NEW_DIRECTORY);
         for(int i = 0; i < 8; i++)
         {
-            if(((int)(*FILENAME)) == FILENAME_PADDING_BYTE)
+            if(((int)(*(FILENAME + i))) == FILENAME_PADDING_BYTE)
             {
                 newDirectory[i] = '/';
                 newDirectory[i+1] = '\0';
                 newDirectory = realloc(newDirectory, sizeof(char) *(i+2));
                 break;
             }
-            newDirectory[i] = *( (char*) (FILENAME));
-            FILENAME++;
+
+            if(((int)(*(FILENAME + i))) == DELETED_ENTRY_BYTE)
+                newDirectory[i] = '_';
+            else
+                newDirectory[i] = *( (char*) (FILENAME + i));
             if(i == 7)
             {
                 newDirectory[8] = '/';
@@ -183,66 +296,68 @@ void scanDirectoryEntry(char * filePath, unsigned char * DirectoryEntry, int Dir
             }
             len++;
         }
-
-
         int lengthOfFilePath = strlen(filePath);
         char * newFilePath = malloc(sizeof(char) * (lengthOfFilePath + len));
         strcpy(newFilePath,filePath);
         strcat(newFilePath,newDirectory);
 
-        //Looks like magic but this is the formula to find the sector of a logical cluster
-        int sectorNumber = 33 + FIRST_LOGICAL_CLUSTER - 2;
-        unsigned char * sectorToScan = disk + ((SECTOR_SIZE*sectorNumber) + (DIRECTORY_ENTRY_SIZE *2)) ;
+        return newFilePath;
+}
 
-        scanDirectoryEntry(newFilePath, sectorToScan,0);
-    }
-    else
-    {
-        //yeah so this is just
-        char  * newDirectory = malloc(sizeof(char) * MAX_LENGTH_FILE);
+filePair_t appendFiletoFilePath(char * filePath, unsigned char * FILENAME, unsigned char * EXTENSION)
+{
+    //yeah so this is just
+        char  * newFile = malloc(sizeof(char) * MAX_LENGTH_FILE);
         int nextPosInString = 0;
         for(int i = 0; i < 8; i++)
         {
 
             if(((int)(*(FILENAME + i))) == FILENAME_PADDING_BYTE)
                 break;
-            newDirectory[i] = *( (char*) (FILENAME+i));
+            else if(((int)(*(FILENAME + i))) == DELETED_ENTRY_BYTE)
+                newFile[i] = '_';
+            else
+                newFile[i] = *( (char*) (FILENAME+i));
             nextPosInString++;
         }
-        newDirectory[nextPosInString] = '.';
+        newFile[nextPosInString] = '.';
+        int extensionStart = nextPosInString;
         nextPosInString++;
 
         for (int i = 0; i < 3; i++)
         {
             if(((int)(*(EXTENSION + i))) == FILENAME_PADDING_BYTE)
                 break;
-            newDirectory[nextPosInString] = *( (char*) (EXTENSION+i));
+            newFile[nextPosInString] = *( (char*) (EXTENSION+i));
             nextPosInString++;
         }
-        newDirectory[nextPosInString] = '\0';
-        newDirectory = realloc(newDirectory, (sizeof(char) * (nextPosInString + 1)));
-
-
+        newFile[nextPosInString] = '\0';
+        newFile= realloc(newFile, (sizeof(char) * (nextPosInString + 1)));
 
         int lengthOfFilePath = strlen(filePath);
-        char * newFilePath = malloc(sizeof(char) * (lengthOfFilePath + nextPosInString+1));
+        char * newFilePath = malloc(sizeof(char) * (lengthOfFilePath + strlen(newFile) + 1));
         strcpy(newFilePath,filePath);
-        strcat(newFilePath,newDirectory);
-        //scanFileClusters(FIRST_LOGICAL_CLUSTER, FILESIZE, newFilePath);
-
-        printf("FILE\tNORMAL\t%s\t%d\n", newFilePath, FILESIZE);
+        strcat(newFilePath,newFile);
 
 
-    }
+        filePair_t filePair;
+        int fileLength;
 
-    if(DirectoryEntryNum != DIRECTORY_ENTRIES_PER_SECTOR -1)
-        scanDirectoryEntry(filePath, DirectoryEntry+32, DirectoryEntryNum++);
+        if(fileNumber == 0)
+            fileLength = 2;
+        else
+            fileLength = log(fileNumber) +2;
+        char * outDirectFileString = malloc(fileLength + strlen("file") + strlen(newFile + extensionStart));
+
+        sprintf(outDirectFileString, "file%d%s",fileNumber, newFile + extensionStart);
+        fileNumber++;
+
+
+
+        filePair.fileName = outDirectFileString;
+        filePair.fullFilePath = newFilePath;
+        return filePair;
 }
-
-
-
-
-
 
 
 
