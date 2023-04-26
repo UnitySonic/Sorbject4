@@ -21,6 +21,7 @@
 #define MAX_LENGTH_FILE 13
 #define NUM_OF_SECTORS 2880
 #define DIRECTORY_ENTRIES_PER_SECTOR 16
+#define NUM_LOGICAL_CLUSTERS 2848
 
 //offsets
 
@@ -119,7 +120,11 @@ void recoverDeletedClusters(int FirstLogicalCluster, int FileSize,  FILE * fileP
         else
         {
             outputClusterToFile(FirstLogicalCluster, SECTOR_SIZE, filePath);
-            recoverDeletedClusters(FirstLogicalCluster+1, FileSize, filePath, currentClustNum + 1);
+
+
+
+            if(FirstLogicalCluster < NUM_LOGICAL_CLUSTERS)
+                recoverDeletedClusters(FirstLogicalCluster+1, FileSize, filePath, currentClustNum + 1);
         }
     }
 }
